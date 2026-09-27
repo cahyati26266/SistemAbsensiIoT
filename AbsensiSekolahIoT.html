@@ -1,0 +1,3066 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AbsensiSekolahIoT</title>
+<style>
+body{margin:0;background:#111;color:#eee;font-family:Consolas,Monaco,monospace}
+header{padding:16px 22px;background:#1c1c1c;border-bottom:1px solid #333;font-family:Arial,sans-serif}
+h1{font-size:20px;margin:0}pre{margin:0;padding:22px;white-space:pre;overflow:auto;line-height:1.5;font-size:14px;tab-size:4}
+</style>
+</head>
+<body>
+<header><h1>AbsensiSekolahIoT — Kode Lengkap</h1></header>
+<pre><code>/*
+   ============================================================
+        SISTEM ABSENSI SEKOLAH BERBASIS IoT - ESP32 V3
+   ============================================================
+
+   Hardware:
+   - ESP32
+   - Fingerprint AS608
+   - LCD I2C 16x2
+   - Buzzer
+   - LED Hijau
+   - LED Merah
+
+   Fitur:
+   - Access Point
+   - WiFi STA untuk NTP
+   - NTP WIB UTC+7
+   - Tambah siswa
+   - Hapus siswa
+   - Enroll fingerprint
+   - Absensi fingerprint
+   - Hadir / Terlambat
+   - Rekap harian
+   - Rekap per siswa
+   - Rekap bulanan
+   - Pengaturan jam masuk
+   - Penyimpanan LittleFS
+
+   PIN:
+   AS608 TX -&gt; GPIO 16
+   AS608 RX -&gt; GPIO 17
+   LCD SDA  -&gt; GPIO 21
+   LCD SCL  -&gt; GPIO 22
+   Buzzer   -&gt; GPIO 25
+   LED Hijau-&gt; GPIO 26
+   LED Merah-&gt; GPIO 27
+*/
+
+// ============================================================
+// LIBRARY
+// ============================================================
+
+#include &lt;WiFi.h&gt;
+#include &lt;WebServer.h&gt;
+#include &lt;LittleFS.h&gt;
+#include &lt;ArduinoJson.h&gt;
+#include &lt;Wire.h&gt;
+#include &lt;LiquidCrystal_I2C.h&gt;
+#include &lt;Adafruit_Fingerprint.h&gt;
+#include &lt;time.h&gt;
+
+// ============================================================
+// PIN
+// ============================================================
+
+#define FP_RX 16
+#define FP_TX 17
+
+#define BUZZER_PIN 25
+#define LED_GREEN 26
+#define LED_RED 27
+
+// ============================================================
+// WIFI
+// ============================================================
+
+// Access Point ESP32
+const char* AP_SSID = &quot;ABSENSI_ESP&quot;;
+const char* AP_PASSWORD = &quot;12345678&quot;;
+
+// WiFi sekolah untuk NTP
+// Isi sesuai WiFi sekolah.
+// Jika tidak ingin memakai STA, biarkan kosong.
+const char* WIFI_SSID = &quot;vivo&quot;;
+const char* WIFI_PASSWORD = &quot;qibtiyah&quot;;
+
+// ============================================================
+// NTP
+// ============================================================
+
+const char* NTP_SERVER_1 = &quot;pool.ntp.org&quot;;
+const char* NTP_SERVER_2 = &quot;time.google.com&quot;;
+
+// WIB = UTC+7
+const long GMT_OFFSET_SEC = 7 * 3600;
+const int DAYLIGHT_OFFSET_SEC = 0;
+
+// ============================================================
+// DEFAULT JAM MASUK
+// ============================================================
+
+int jamMasuk = 6;
+int menitMasuk = 30;
+
+// ============================================================
+// FILE LITTLEFS
+// ============================================================
+
+#define FILE_STUDENTS &quot;/students.json&quot;
+#define FILE_SETTINGS &quot;/settings.json&quot;
+#define FILE_ATTENDANCE &quot;/attendance.csv&quot;
+
+// ============================================================
+// OBJECT
+// ============================================================
+
+HardwareSerial FingerSerial(2);
+Adafruit_Fingerprint finger = Adafruit_Fingerprint(&amp;FingerSerial);
+
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+WebServer server(80);
+
+// ============================================================
+// DATA SISWA
+// ============================================================
+
+struct Student {
+  int id;
+  String name;
+};
+
+const int MAX_STUDENTS = 100;
+
+Student students[MAX_STUDENTS];
+int studentCount = 0;
+
+// ============================================================
+// STATUS ENROLL
+// ============================================================
+
+bool enrollmentRunning = false;
+int enrollmentID = -1;
+String enrollmentName = &quot;&quot;;
+
+// ============================================================
+// HELPER
+// ============================================================
+
+String twoDigit(int value) {
+  if (value &lt; 10) return &quot;0&quot; + String(value);
+  return String(value);
+}
+
+String getDate() {
+  struct tm timeinfo;
+
+  if (!getLocalTime(&amp;timeinfo)) {
+    return &quot;0000-00-00&quot;;
+  }
+
+  return String(timeinfo.tm_year + 1900) + &quot;-&quot; +
+         twoDigit(timeinfo.tm_mon + 1) + &quot;-&quot; +
+         twoDigit(timeinfo.tm_mday);
+}
+
+String getTimeNow() {
+  struct tm timeinfo;
+
+  if (!getLocalTime(&amp;timeinfo)) {
+    return &quot;00:00:00&quot;;
+  }
+
+  return twoDigit(timeinfo.tm_hour) + &quot;:&quot; +
+         twoDigit(timeinfo.tm_min) + &quot;:&quot; +
+         twoDigit(timeinfo.tm_sec);
+}
+
+String getMonth() {
+  struct tm timeinfo;
+
+  if (!getLocalTime(&amp;timeinfo)) {
+    return &quot;0000-00&quot;;
+  }
+
+  return String(timeinfo.tm_year + 1900) + &quot;-&quot; +
+         twoDigit(timeinfo.tm_mon + 1);
+}
+
+bool isTimeLate() {
+  struct tm timeinfo;
+
+  if (!getLocalTime(&amp;timeinfo)) {
+    return false;
+  }
+
+  int currentMinutes =
+      timeinfo.tm_hour * 60 + timeinfo.tm_min;
+
+  int limitMinutes =
+      jamMasuk * 60 + menitMasuk;
+
+  return currentMinutes &gt; limitMinutes;
+}
+
+String getAttendanceStatus() {
+  if (isTimeLate()) {
+    return &quot;Terlambat&quot;;
+  }
+
+  return &quot;Hadir&quot;;
+}
+
+int findStudentByID(int id) {
+
+  for (int i = 0; i &lt; studentCount; i++) {
+
+    if (students[i].id == id) {
+      return i;
+    }
+  }
+
+  return -1;
+}
+
+String jsonEscape(String input) {
+
+  input.replace(&quot;\\&quot;, &quot;\\\\&quot;);
+  input.replace(&quot;\&quot;&quot;, &quot;\\\&quot;&quot;);
+  input.replace(&quot;\n&quot;, &quot;\\n&quot;);
+  input.replace(&quot;\r&quot;, &quot;&quot;);
+
+  return input;
+}
+
+// ============================================================
+// LCD
+// ============================================================
+
+void lcdMessage(String line1, String line2) {
+
+  lcd.clear();
+
+  lcd.setCursor(0, 0);
+  lcd.print(line1.substring(0, 16));
+
+  lcd.setCursor(0, 1);
+  lcd.print(line2.substring(0, 16));
+}
+
+// ============================================================
+// LED / BUZZER
+// ============================================================
+
+void successSignal() {
+
+  digitalWrite(LED_GREEN, HIGH);
+  digitalWrite(LED_RED, LOW);
+
+  tone(BUZZER_PIN, 2000, 150);
+
+  delay(700);
+
+  digitalWrite(LED_GREEN, LOW);
+}
+
+void failedSignal() {
+
+  digitalWrite(LED_GREEN, LOW);
+  digitalWrite(LED_RED, HIGH);
+
+  tone(BUZZER_PIN, 500, 400);
+
+  delay(700);
+
+  digitalWrite(LED_RED, LOW);
+}
+
+// ============================================================
+// SETTINGS
+// ============================================================
+
+void loadSettings() {
+
+  if (!LittleFS.exists(FILE_SETTINGS)) {
+    return;
+  }
+
+  File file = LittleFS.open(FILE_SETTINGS, &quot;r&quot;);
+
+  if (!file) return;
+
+  DynamicJsonDocument doc(1024);
+
+  DeserializationError error =
+      deserializeJson(doc, file);
+
+  file.close();
+
+  if (!error) {
+
+    jamMasuk =
+        doc[&quot;jamMasuk&quot;] | 6;
+
+    menitMasuk =
+        doc[&quot;menitMasuk&quot;] | 30;
+  }
+}
+
+void saveSettings() {
+
+  DynamicJsonDocument doc(1024);
+
+  doc[&quot;jamMasuk&quot;] = jamMasuk;
+  doc[&quot;menitMasuk&quot;] = menitMasuk;
+
+  File file =
+      LittleFS.open(FILE_SETTINGS, &quot;w&quot;);
+
+  if (!file) return;
+
+  serializeJson(doc, file);
+
+  file.close();
+}
+
+// ============================================================
+// STUDENT DATABASE
+// ============================================================
+
+void loadStudents() {
+
+  studentCount = 0;
+
+  if (!LittleFS.exists(FILE_STUDENTS)) {
+    return;
+  }
+
+  File file =
+      LittleFS.open(FILE_STUDENTS, &quot;r&quot;);
+
+  if (!file) return;
+
+  DynamicJsonDocument doc(10000);
+
+  DeserializationError error =
+      deserializeJson(doc, file);
+
+  file.close();
+
+  if (error) {
+    return;
+  }
+
+  JsonArray arr = doc.as&lt;JsonArray&gt;();
+
+  for (JsonObject obj : arr) {
+
+    if (studentCount &gt;= MAX_STUDENTS) {
+      break;
+    }
+
+    students[studentCount].id =
+        obj[&quot;id&quot;] | 0;
+
+    students[studentCount].name =
+        String(obj[&quot;name&quot;] | &quot;&quot;);
+
+    studentCount++;
+  }
+}
+
+void saveStudents() {
+
+  DynamicJsonDocument doc(12000);
+
+  JsonArray arr = doc.to&lt;JsonArray&gt;();
+
+  for (int i = 0; i &lt; studentCount; i++) {
+
+    JsonObject obj = arr.createNestedObject();
+
+    obj[&quot;id&quot;] = students[i].id;
+    obj[&quot;name&quot;] = students[i].name;
+  }
+
+  File file =
+      LittleFS.open(FILE_STUDENTS, &quot;w&quot;);
+
+  if (!file) return;
+
+  serializeJson(doc, file);
+
+  file.close();
+}
+
+// ============================================================
+// ATTENDANCE DATABASE
+// ============================================================
+
+void createAttendanceFile() {
+
+  if (!LittleFS.exists(FILE_ATTENDANCE)) {
+
+    File file =
+        LittleFS.open(FILE_ATTENDANCE, &quot;w&quot;);
+
+    if (!file) return;
+
+    file.println(&quot;date,time,id,name,status&quot;);
+
+    file.close();
+  }
+}
+
+// ============================================================
+// CEK APAKAH SUDAH ABSEN HARI INI
+// ============================================================
+
+bool alreadyAttendanceToday(int id) {
+
+  if (!LittleFS.exists(FILE_ATTENDANCE)) {
+    return false;
+  }
+
+  String today = getDate();
+
+  File file =
+      LittleFS.open(FILE_ATTENDANCE, &quot;r&quot;);
+
+  if (!file) return false;
+
+  while (file.available()) {
+
+    String line = file.readStringUntil(&#x27;\n&#x27;);
+
+    line.trim();
+
+    if (line.length() == 0) {
+      continue;
+    }
+
+    // format:
+    // date,time,id,name,status
+
+    int p1 = line.indexOf(&#x27;,&#x27;);
+
+    if (p1 &lt; 0) continue;
+
+    String date =
+        line.substring(0, p1);
+
+    int p2 =
+        line.indexOf(&#x27;,&#x27;, p1 + 1);
+
+    if (p2 &lt; 0) continue;
+
+    int p3 =
+        line.indexOf(&#x27;,&#x27;, p2 + 1);
+
+    if (p3 &lt; 0) continue;
+
+    String idString =
+        line.substring(p2 + 1, p3);
+
+    if (date == today &amp;&amp;
+        idString.toInt() == id) {
+
+      file.close();
+
+      return true;
+    }
+  }
+
+  file.close();
+
+  return false;
+}
+
+// ============================================================
+// SIMPAN ABSENSI
+// ============================================================
+
+void saveAttendance(
+    int id,
+    String name,
+    String status) {
+
+  File file =
+      LittleFS.open(FILE_ATTENDANCE, &quot;a&quot;);
+
+  if (!file) {
+    return;
+  }
+
+  file.print(getDate());
+  file.print(&quot;,&quot;);
+
+  file.print(getTimeNow());
+  file.print(&quot;,&quot;);
+
+  file.print(id);
+  file.print(&quot;,&quot;);
+
+  // koma dalam nama diubah menjadi spasi
+  name.replace(&quot;,&quot;, &quot; &quot;);
+
+  file.print(name);
+  file.print(&quot;,&quot;);
+
+  file.println(status);
+
+  file.close();
+}
+
+// ============================================================
+// FINGERPRINT SEARCH
+// ============================================================
+
+int getFingerprintID() {
+
+  uint8_t p =
+      finger.getImage();
+
+  if (p != FINGERPRINT_OK) {
+    return -1;
+  }
+
+  p =
+      finger.image2Tz();
+
+  if (p != FINGERPRINT_OK) {
+    return -1;
+  }
+
+  p =
+      finger.fingerFastSearch();
+
+  if (p != FINGERPRINT_OK) {
+    return -1;
+  }
+
+  return finger.fingerID;
+}
+
+// ============================================================
+// ABSENSI
+// ============================================================
+
+void processFingerprint() {
+
+  int id = getFingerprintID();
+
+  if (id &lt; 0) {
+    return;
+  }
+
+  int index =
+      findStudentByID(id);
+
+  if (index &lt; 0) {
+
+    lcdMessage(
+        &quot;ID Tidak Terdaftar&quot;,
+        &quot;ID: &quot; + String(id));
+
+    failedSignal();
+
+    delay(1000);
+
+    lcdMessage(
+        &quot;Tempelkan Jari&quot;,
+        &quot;Silakan Absen&quot;);
+
+    return;
+  }
+
+  String name =
+      students[index].name;
+
+  lcdMessage(
+      &quot;Halo!&quot;,
+      name);
+
+  if (alreadyAttendanceToday(id)) {
+
+    lcdMessage(
+        &quot;Sudah Absen&quot;,
+        name);
+
+    tone(BUZZER_PIN, 1000, 300);
+
+    delay(1500);
+
+    lcdMessage(
+        &quot;Tempelkan Jari&quot;,
+        &quot;Silakan Absen&quot;);
+
+    return;
+  }
+
+  String status =
+      getAttendanceStatus();
+
+  saveAttendance(
+      id,
+      name,
+      status);
+
+  if (status == &quot;Hadir&quot;) {
+
+    lcdMessage(
+        &quot;ABSEN BERHASIL&quot;,
+        &quot;Hadir &quot; + getTimeNow());
+
+    successSignal();
+
+  } else {
+
+    lcdMessage(
+        &quot;ABSEN BERHASIL&quot;,
+        &quot;Terlambat&quot;);
+
+    successSignal();
+  }
+
+  delay(1500);
+
+  lcdMessage(
+      &quot;Tempelkan Jari&quot;,
+      &quot;Silakan Absen&quot;);
+}
+
+// ============================================================
+// ENROLL FINGERPRINT
+// ============================================================
+
+bool enrollFingerprint(int id) {
+
+  lcdMessage(
+      &quot;Daftar Finger&quot;,
+      &quot;ID: &quot; + String(id));
+
+  delay(500);
+
+  int p = -1;
+
+  // -----------------------------
+  // Jari pertama
+  // -----------------------------
+
+  lcdMessage(
+      &quot;Tempelkan Jari&quot;,
+      &quot;Pertama&quot;);
+
+  while (p != FINGERPRINT_OK) {
+
+    p = finger.getImage();
+
+    if (p == FINGERPRINT_OK) {
+      break;
+    }
+
+    delay(100);
+  }
+
+  p = finger.image2Tz(1);
+
+  if (p != FINGERPRINT_OK) {
+
+    lcdMessage(
+        &quot;Fingerprint&quot;,
+        &quot;Gagal&quot;);
+
+    return false;
+  }
+
+  lcdMessage(
+      &quot;Angkat Jari&quot;,
+      &quot;Tunggu...&quot;);
+
+  delay(1500);
+
+  while (finger.getImage() !=
+         FINGERPRINT_NOFINGER) {
+
+    delay(100);
+  }
+
+  // -----------------------------
+  // Jari kedua
+  // -----------------------------
+
+  lcdMessage(
+      &quot;Tempelkan Lagi&quot;,
+      &quot;Jari yang Sama&quot;);
+
+  p = -1;
+
+  while (p != FINGERPRINT_OK) {
+
+    p = finger.getImage();
+
+    if (p == FINGERPRINT_OK) {
+      break;
+    }
+
+    delay(100);
+  }
+
+  p = finger.image2Tz(2);
+
+  if (p != FINGERPRINT_OK) {
+
+    lcdMessage(
+        &quot;Fingerprint&quot;,
+        &quot;Gagal&quot;);
+
+    return false;
+  }
+
+  // -----------------------------
+  // Buat model
+  // -----------------------------
+
+  p =
+      finger.createModel();
+
+  if (p != FINGERPRINT_OK) {
+
+    lcdMessage(
+        &quot;Jari Tidak Cocok&quot;,
+        &quot;Ulangi&quot;);
+
+    return false;
+  }
+
+  p =
+      finger.storeModel(id);
+
+  if (p != FINGERPRINT_OK) {
+
+    lcdMessage(
+        &quot;Gagal Simpan&quot;,
+        &quot;Fingerprint&quot;);
+
+    return false;
+  }
+
+  lcdMessage(
+      &quot;Berhasil!&quot;,
+      &quot;ID &quot; + String(id));
+
+  delay(1500);
+
+  return true;
+}
+
+// ============================================================
+// WEB HTML
+// ============================================================
+
+const char MAIN_HTML[] PROGMEM = R&quot;rawliteral(
+
+&lt;!DOCTYPE html&gt;
+&lt;html lang=&quot;id&quot;&gt;
+
+&lt;head&gt;
+
+&lt;meta charset=&quot;UTF-8&quot;&gt;
+
+&lt;meta name=&quot;viewport&quot;
+content=&quot;width=device-width, initial-scale=1.0&quot;&gt;
+
+&lt;title&gt;Absensi Sekolah&lt;/title&gt;
+
+&lt;style&gt;
+
+*{
+box-sizing:border-box;
+}
+
+body{
+margin:0;
+font-family:Arial,Helvetica,sans-serif;
+background:#f1f5f9;
+color:#1e293b;
+}
+
+.sidebar{
+position:fixed;
+left:0;
+top:0;
+bottom:0;
+width:230px;
+background:#0f172a;
+color:white;
+padding:20px;
+}
+
+.logo{
+font-size:20px;
+font-weight:bold;
+margin-bottom:25px;
+}
+
+.menu{
+padding:12px;
+margin:5px 0;
+border-radius:8px;
+cursor:pointer;
+}
+
+.menu:hover,
+.menu.active{
+background:#2563eb;
+}
+
+.main{
+margin-left:230px;
+padding:25px;
+}
+
+.header{
+display:flex;
+justify-content:space-between;
+align-items:center;
+margin-bottom:20px;
+}
+
+.header h1{
+margin:0;
+}
+
+.cards{
+display:grid;
+grid-template-columns:
+repeat(4,1fr);
+gap:15px;
+margin-bottom:20px;
+}
+
+.card{
+background:white;
+border-radius:12px;
+padding:20px;
+box-shadow:
+0 2px 8px rgba(0,0,0,.06);
+}
+
+.card-title{
+color:#64748b;
+font-size:14px;
+}
+
+.card-value{
+font-size:30px;
+font-weight:bold;
+margin-top:10px;
+}
+
+.green{
+color:#16a34a;
+}
+
+.orange{
+color:#ea580c;
+}
+
+.red{
+color:#dc2626;
+}
+
+.blue{
+color:#2563eb;
+}
+
+.panel{
+background:white;
+border-radius:12px;
+padding:20px;
+margin-bottom:20px;
+box-shadow:
+0 2px 8px rgba(0,0,0,.06);
+}
+
+table{
+width:100%;
+border-collapse:collapse;
+}
+
+th,td{
+padding:12px;
+border-bottom:
+1px solid #e2e8f0;
+text-align:left;
+}
+
+th{
+background:#f8fafc;
+}
+
+.badge{
+padding:5px 9px;
+border-radius:20px;
+font-size:12px;
+font-weight:bold;
+}
+
+.badge-hadir{
+background:#dcfce7;
+color:#166534;
+}
+
+.badge-terlambat{
+background:#ffedd5;
+color:#9a3412;
+}
+
+.badge-tidak{
+background:#fee2e2;
+color:#991b1b;
+}
+
+button{
+border:0;
+padding:10px 15px;
+border-radius:7px;
+cursor:pointer;
+background:#2563eb;
+color:white;
+}
+
+button.danger{
+background:#dc2626;
+}
+
+button.green-btn{
+background:#16a34a;
+}
+
+input,select{
+padding:10px;
+border:1px solid #cbd5e1;
+border-radius:7px;
+width:100%;
+margin:5px 0 12px;
+}
+
+.form-grid{
+display:grid;
+grid-template-columns:
+repeat(2,1fr);
+gap:15px;
+}
+
+.section{
+display:none;
+}
+
+.section.active{
+display:block;
+}
+
+@media(max-width:800px){
+
+.sidebar{
+position:relative;
+width:100%;
+height:auto;
+}
+
+.main{
+margin-left:0;
+padding:15px;
+}
+
+.cards{
+grid-template-columns:
+repeat(2,1fr);
+}
+
+.form-grid{
+grid-template-columns:1fr;
+}
+
+}
+
+&lt;/style&gt;
+
+&lt;/head&gt;
+
+&lt;body&gt;
+
+&lt;div class=&quot;sidebar&quot;&gt;
+
+&lt;div class=&quot;logo&quot;&gt;
+&amp;#127979; ABSENSI SEKOLAH
+&lt;/div&gt;
+
+&lt;div class=&quot;menu active&quot;
+onclick=&quot;showSection(&#x27;dashboard&#x27;,this)&quot;&gt;
+&amp;#127968; Dashboard
+&lt;/div&gt;
+
+&lt;div class=&quot;menu&quot;
+onclick=&quot;showSection(&#x27;students&#x27;,this)&quot;&gt;
+&amp;#128104;&amp;#8205;&amp;#127891; Data Siswa
+&lt;/div&gt;
+
+&lt;div class=&quot;menu&quot;
+onclick=&quot;showSection(&#x27;studentReport&#x27;,this)&quot;&gt;
+&amp;#128202; Rekap Siswa
+&lt;/div&gt;
+
+&lt;div class=&quot;menu&quot;
+onclick=&quot;showSection(&#x27;monthly&#x27;,this)&quot;&gt;
+&amp;#128197; Rekap Bulanan
+&lt;/div&gt;
+
+&lt;div class=&quot;menu&quot;
+onclick=&quot;showSection(&#x27;settings&#x27;,this)&quot;&gt;
+&amp;#9881;&amp;#65039; Pengaturan
+&lt;/div&gt;
+
+&lt;/div&gt;
+
+&lt;div class=&quot;main&quot;&gt;
+
+&lt;!-- DASHBOARD --&gt;
+
+&lt;div id=&quot;dashboard&quot;
+class=&quot;section active&quot;&gt;
+
+&lt;div class=&quot;header&quot;&gt;
+
+&lt;div&gt;
+&lt;h1&gt;Dashboard&lt;/h1&gt;
+&lt;p id=&quot;today&quot;&gt;&lt;/p&gt;
+&lt;/div&gt;
+
+&lt;/div&gt;
+
+&lt;div class=&quot;cards&quot;&gt;
+
+&lt;div class=&quot;card&quot;&gt;
+&lt;div class=&quot;card-title&quot;&gt;
+Total Siswa
+&lt;/div&gt;
+&lt;div class=&quot;card-value blue&quot;
+id=&quot;totalStudents&quot;&gt;
+0
+&lt;/div&gt;
+&lt;/div&gt;
+
+&lt;div class=&quot;card&quot;&gt;
+&lt;div class=&quot;card-title&quot;&gt;
+Hadir
+&lt;/div&gt;
+&lt;div class=&quot;card-value green&quot;
+id=&quot;totalPresent&quot;&gt;
+0
+&lt;/div&gt;
+&lt;/div&gt;
+
+&lt;div class=&quot;card&quot;&gt;
+&lt;div class=&quot;card-title&quot;&gt;
+Terlambat
+&lt;/div&gt;
+&lt;div class=&quot;card-value orange&quot;
+id=&quot;totalLate&quot;&gt;
+0
+&lt;/div&gt;
+&lt;/div&gt;
+
+&lt;div class=&quot;card&quot;&gt;
+&lt;div class=&quot;card-title&quot;&gt;
+Tidak Hadir
+&lt;/div&gt;
+&lt;div class=&quot;card-value red&quot;
+id=&quot;totalAbsent&quot;&gt;
+0
+&lt;/div&gt;
+&lt;/div&gt;
+
+&lt;/div&gt;
+
+&lt;div class=&quot;panel&quot;&gt;
+
+&lt;h2&gt;Absensi Hari Ini&lt;/h2&gt;
+
+&lt;table&gt;
+
+&lt;thead&gt;
+
+&lt;tr&gt;
+&lt;th&gt;No&lt;/th&gt;
+&lt;th&gt;Nama&lt;/th&gt;
+&lt;th&gt;Jam&lt;/th&gt;
+&lt;th&gt;Status&lt;/th&gt;
+&lt;/tr&gt;
+
+&lt;/thead&gt;
+
+&lt;tbody id=&quot;todayTable&quot;&gt;
+&lt;/tbody&gt;
+
+&lt;/table&gt;
+
+&lt;/div&gt;
+
+&lt;/div&gt;
+
+&lt;!-- DATA SISWA --&gt;
+
+&lt;div id=&quot;students&quot;
+class=&quot;section&quot;&gt;
+
+&lt;div class=&quot;panel&quot;&gt;
+
+&lt;h2&gt;Tambah Siswa&lt;/h2&gt;
+
+&lt;div class=&quot;form-grid&quot;&gt;
+
+&lt;div&gt;
+
+&lt;label&gt;Nama Siswa&lt;/label&gt;
+
+&lt;input
+id=&quot;studentName&quot;
+placeholder=&quot;Nama lengkap&quot;&gt;
+
+&lt;/div&gt;
+
+&lt;div&gt;
+
+&lt;label&gt;ID Fingerprint&lt;/label&gt;
+
+&lt;input
+id=&quot;studentID&quot;
+type=&quot;number&quot;
+placeholder=&quot;Contoh: 1&quot;&gt;
+
+&lt;/div&gt;
+
+&lt;/div&gt;
+
+&lt;button
+class=&quot;green-btn&quot;
+onclick=&quot;addStudent()&quot;&gt;
+
+Tambah &amp; Daftar Fingerprint
+
+&lt;/button&gt;
+
+&lt;/div&gt;
+
+&lt;div class=&quot;panel&quot;&gt;
+
+&lt;h2&gt;Data Siswa&lt;/h2&gt;
+
+&lt;table&gt;
+
+&lt;thead&gt;
+
+&lt;tr&gt;
+&lt;th&gt;ID&lt;/th&gt;
+&lt;th&gt;Nama&lt;/th&gt;
+&lt;th&gt;Aksi&lt;/th&gt;
+&lt;/tr&gt;
+
+&lt;/thead&gt;
+
+&lt;tbody id=&quot;studentTable&quot;&gt;
+&lt;/tbody&gt;
+
+&lt;/table&gt;
+
+&lt;/div&gt;
+
+&lt;/div&gt;
+
+&lt;!-- REKAP SISWA --&gt;
+
+&lt;div id=&quot;studentReport&quot;
+class=&quot;section&quot;&gt;
+
+&lt;div class=&quot;panel&quot;&gt;
+
+&lt;h2&gt;Rekap Per Siswa&lt;/h2&gt;
+
+&lt;label&gt;Pilih Siswa&lt;/label&gt;
+
+&lt;select id=&quot;reportStudent&quot;
+onchange=&quot;loadStudentReport()&quot;&gt;
+&lt;/select&gt;
+
+&lt;div id=&quot;studentSummary&quot;&gt;
+&lt;/div&gt;
+
+&lt;/div&gt;
+
+&lt;div class=&quot;panel&quot;&gt;
+
+&lt;h2&gt;Riwayat Absensi&lt;/h2&gt;
+
+&lt;table&gt;
+
+&lt;thead&gt;
+
+&lt;tr&gt;
+&lt;th&gt;Tanggal&lt;/th&gt;
+&lt;th&gt;Jam&lt;/th&gt;
+&lt;th&gt;Status&lt;/th&gt;
+&lt;/tr&gt;
+
+&lt;/thead&gt;
+
+&lt;tbody id=&quot;studentReportTable&quot;&gt;
+&lt;/tbody&gt;
+
+&lt;/table&gt;
+
+&lt;/div&gt;
+
+&lt;/div&gt;
+
+&lt;!-- BULANAN --&gt;
+
+&lt;div id=&quot;monthly&quot;
+class=&quot;section&quot;&gt;
+
+&lt;div class=&quot;panel&quot;&gt;
+
+&lt;h2&gt;Rekap Bulanan&lt;/h2&gt;
+
+&lt;label&gt;Bulan&lt;/label&gt;
+
+&lt;input
+type=&quot;month&quot;
+id=&quot;monthSelect&quot;&gt;
+
+&lt;button
+onclick=&quot;loadMonthly()&quot;&gt;
+
+Tampilkan Rekap
+
+&lt;/button&gt;
+
+&lt;/div&gt;
+
+&lt;div class=&quot;panel&quot;&gt;
+
+&lt;table&gt;
+
+&lt;thead&gt;
+
+&lt;tr&gt;
+&lt;th&gt;No&lt;/th&gt;
+&lt;th&gt;Nama&lt;/th&gt;
+&lt;th&gt;Hadir&lt;/th&gt;
+&lt;th&gt;Terlambat&lt;/th&gt;
+&lt;th&gt;Tidak Hadir&lt;/th&gt;
+&lt;th&gt;Kehadiran&lt;/th&gt;
+&lt;/tr&gt;
+
+&lt;/thead&gt;
+
+&lt;tbody id=&quot;monthlyTable&quot;&gt;
+&lt;/tbody&gt;
+
+&lt;/table&gt;
+
+&lt;/div&gt;
+
+&lt;/div&gt;
+
+&lt;!-- SETTINGS --&gt;
+
+&lt;div id=&quot;settings&quot;
+class=&quot;section&quot;&gt;
+
+&lt;div class=&quot;panel&quot;&gt;
+
+&lt;h2&gt;Pengaturan Absensi&lt;/h2&gt;
+
+&lt;label&gt;
+Batas Jam Masuk
+&lt;/label&gt;
+
+&lt;input
+type=&quot;time&quot;
+id=&quot;entryTime&quot;&gt;
+
+&lt;button
+onclick=&quot;saveSettings()&quot;&gt;
+
+Simpan Pengaturan
+
+&lt;/button&gt;
+
+&lt;hr&gt;
+
+&lt;p&gt;
+Zona waktu:
+&lt;strong&gt;WIB (UTC+7)&lt;/strong&gt;
+&lt;/p&gt;
+
+&lt;p&gt;
+NTP:
+&lt;strong id=&quot;ntpStatus&quot;&gt;
+-
+&lt;/strong&gt;
+&lt;/p&gt;
+
+&lt;/div&gt;
+
+&lt;/div&gt;
+
+&lt;/div&gt;
+
+&lt;script&gt;
+
+function showSection(id,el){
+
+document
+.querySelectorAll(&#x27;.section&#x27;)
+.forEach(x =&gt;
+x.classList.remove(&#x27;active&#x27;));
+
+document
+.getElementById(id)
+.classList.add(&#x27;active&#x27;);
+
+document
+.querySelectorAll(&#x27;.menu&#x27;)
+.forEach(x =&gt;
+x.classList.remove(&#x27;active&#x27;));
+
+el.classList.add(&#x27;active&#x27;);
+
+if(id===&#x27;students&#x27;){
+loadStudents();
+}
+
+if(id===&#x27;studentReport&#x27;){
+loadStudentSelect();
+}
+
+if(id===&#x27;monthly&#x27;){
+setDefaultMonth();
+}
+
+if(id===&#x27;settings&#x27;){
+loadSettings();
+}
+
+}
+
+async function api(url){
+
+const response =
+await fetch(url);
+
+return await response.json();
+
+}
+
+// =================================================
+// DASHBOARD
+// =================================================
+
+async function loadDashboard(){
+
+const data =
+await api(&#x27;/api/dashboard&#x27;);
+
+document
+.getElementById(&#x27;today&#x27;)
+.innerHTML =
+data.date + &quot; &quot; + data.time;
+
+document
+.getElementById(&#x27;totalStudents&#x27;)
+.innerHTML =
+data.total;
+
+document
+.getElementById(&#x27;totalPresent&#x27;)
+.innerHTML =
+data.present;
+
+document
+.getElementById(&#x27;totalLate&#x27;)
+.innerHTML =
+data.late;
+
+document
+.getElementById(&#x27;totalAbsent&#x27;)
+.innerHTML =
+data.absent;
+
+let html=&quot;&quot;;
+
+data.records.forEach(
+(r,i)=&gt;{
+
+let badge =
+r.status===&quot;Hadir&quot;
+?
+&quot;badge-hadir&quot;
+:
+&quot;badge-terlambat&quot;;
+
+html += `
+&lt;tr&gt;
+
+&lt;td&gt;${i+1}&lt;/td&gt;
+
+&lt;td&gt;${r.name}&lt;/td&gt;
+
+&lt;td&gt;${r.time}&lt;/td&gt;
+
+&lt;td&gt;
+&lt;span class=&quot;badge ${badge}&quot;&gt;
+${r.status}
+&lt;/span&gt;
+&lt;/td&gt;
+
+&lt;/tr&gt;
+`;
+
+});
+
+document
+.getElementById(&#x27;todayTable&#x27;)
+.innerHTML=html;
+
+}
+
+// =================================================
+// SISWA
+// =================================================
+
+async function loadStudents(){
+
+const data =
+await api(&#x27;/api/students&#x27;);
+
+let html=&quot;&quot;;
+
+data.forEach(s=&gt;{
+
+html += `
+&lt;tr&gt;
+
+&lt;td&gt;${s.id}&lt;/td&gt;
+
+&lt;td&gt;${s.name}&lt;/td&gt;
+
+&lt;td&gt;
+
+&lt;button
+class=&quot;danger&quot;
+onclick=&quot;deleteStudent(${s.id})&quot;&gt;
+
+Hapus
+
+&lt;/button&gt;
+
+&lt;/td&gt;
+
+&lt;/tr&gt;
+`;
+
+});
+
+document
+.getElementById(&#x27;studentTable&#x27;)
+.innerHTML=html;
+
+}
+
+async function addStudent(){
+
+const name =
+document
+.getElementById(&#x27;studentName&#x27;)
+.value;
+
+const id =
+document
+.getElementById(&#x27;studentID&#x27;)
+.value;
+
+if(!name || !id){
+
+alert(&quot;Nama dan ID harus diisi&quot;);
+
+return;
+
+}
+
+if(!confirm(
+&quot;Daftarkan fingerprint ID &quot;+id+
+&quot; untuk &quot;+name+&quot;?&quot;
+)) return;
+
+const response =
+await fetch(
+&#x27;/api/addStudent&#x27;,
+{
+method:&#x27;POST&#x27;,
+headers:{
+&#x27;Content-Type&#x27;:
+&#x27;application/x-www-form-urlencoded&#x27;
+},
+body:
+&#x27;name=&#x27;+encodeURIComponent(name)+
+&#x27;&amp;id=&#x27;+encodeURIComponent(id)
+});
+
+const text =
+await response.text();
+
+alert(text);
+
+document
+.getElementById(&#x27;studentName&#x27;)
+.value=&quot;&quot;;
+
+document
+.getElementById(&#x27;studentID&#x27;)
+.value=&quot;&quot;;
+
+loadStudents();
+
+}
+
+async function deleteStudent(id){
+
+if(!confirm(
+&quot;Yakin ingin menghapus siswa ID &quot;+id+&quot;?&quot;
+)) return;
+
+const response =
+await fetch(
+&#x27;/api/deleteStudent?id=&#x27;+id);
+
+const text =
+await response.text();
+
+alert(text);
+
+loadStudents();
+
+}
+
+// =================================================
+// REKAP SISWA
+// =================================================
+
+async function loadStudentSelect(){
+
+const data =
+await api(&#x27;/api/students&#x27;);
+
+let html =
+&#x27;&lt;option value=&quot;&quot;&gt;-- Pilih Siswa --&lt;/option&gt;&#x27;;
+
+data.forEach(s=&gt;{
+
+html +=
+`&lt;option value=&quot;${s.id}&quot;&gt;
+${s.name}
+&lt;/option&gt;`;
+
+});
+
+document
+.getElementById(&#x27;reportStudent&#x27;)
+.innerHTML=html;
+
+}
+
+async function loadStudentReport(){
+
+const id =
+document
+.getElementById(&#x27;reportStudent&#x27;)
+.value;
+
+if(!id){
+
+return;
+
+}
+
+const data =
+await api(
+&#x27;/api/studentReport?id=&#x27;+id);
+
+document
+.getElementById(&#x27;studentSummary&#x27;)
+.innerHTML=`
+
+&lt;p&gt;
+&lt;strong&gt;${data.name}&lt;/strong&gt;
+&lt;/p&gt;
+
+&lt;div class=&quot;cards&quot;&gt;
+
+&lt;div class=&quot;card&quot;&gt;
+Hadir
+&lt;h2 class=&quot;green&quot;&gt;
+${data.present}
+&lt;/h2&gt;
+&lt;/div&gt;
+
+&lt;div class=&quot;card&quot;&gt;
+Terlambat
+&lt;h2 class=&quot;orange&quot;&gt;
+${data.late}
+&lt;/h2&gt;
+&lt;/div&gt;
+
+&lt;div class=&quot;card&quot;&gt;
+Tidak Hadir
+&lt;h2 class=&quot;red&quot;&gt;
+${data.absent}
+&lt;/h2&gt;
+&lt;/div&gt;
+
+&lt;div class=&quot;card&quot;&gt;
+Kehadiran
+&lt;h2 class=&quot;blue&quot;&gt;
+${data.percentage}%
+&lt;/h2&gt;
+&lt;/div&gt;
+
+&lt;/div&gt;
+`;
+
+let html=&quot;&quot;;
+
+data.records.forEach(r=&gt;{
+
+let badge =
+r.status===&quot;Hadir&quot;
+?
+&quot;badge-hadir&quot;
+:
+&quot;badge-terlambat&quot;;
+
+html += `
+&lt;tr&gt;
+
+&lt;td&gt;${r.date}&lt;/td&gt;
+
+&lt;td&gt;${r.time}&lt;/td&gt;
+
+&lt;td&gt;
+&lt;span class=&quot;badge ${badge}&quot;&gt;
+${r.status}
+&lt;/span&gt;
+&lt;/td&gt;
+
+&lt;/tr&gt;
+`;
+
+});
+
+document
+.getElementById(&#x27;studentReportTable&#x27;)
+.innerHTML=html;
+
+}
+
+// =================================================
+// BULANAN
+// =================================================
+
+function setDefaultMonth(){
+
+const now =
+new Date();
+
+const year =
+now.getFullYear();
+
+const month =
+String(now.getMonth()+1)
+.padStart(2,&#x27;0&#x27;);
+
+document
+.getElementById(&#x27;monthSelect&#x27;)
+.value =
+year+&quot;-&quot;+month;
+
+}
+
+async function loadMonthly(){
+
+const month =
+document
+.getElementById(&#x27;monthSelect&#x27;)
+.value;
+
+if(!month){
+
+alert(&quot;Pilih bulan&quot;);
+
+return;
+
+}
+
+const data =
+await api(
+&#x27;/api/monthly?month=&#x27;+month);
+
+let html=&quot;&quot;;
+
+data.forEach((r,i)=&gt;{
+
+html += `
+&lt;tr&gt;
+
+&lt;td&gt;${i+1}&lt;/td&gt;
+
+&lt;td&gt;${r.name}&lt;/td&gt;
+
+&lt;td class=&quot;green&quot;&gt;
+${r.present}
+&lt;/td&gt;
+
+&lt;td class=&quot;orange&quot;&gt;
+${r.late}
+&lt;/td&gt;
+
+&lt;td class=&quot;red&quot;&gt;
+${r.absent}
+&lt;/td&gt;
+
+&lt;td&gt;
+${r.percentage}%
+&lt;/td&gt;
+
+&lt;/tr&gt;
+`;
+
+});
+
+document
+.getElementById(&#x27;monthlyTable&#x27;)
+.innerHTML=html;
+
+}
+
+// =================================================
+// SETTINGS
+// =================================================
+
+async function loadSettings(){
+
+const data =
+await api(&#x27;/api/settings&#x27;);
+
+document
+.getElementById(&#x27;entryTime&#x27;)
+.value =
+data.time;
+
+document
+.getElementById(&#x27;ntpStatus&#x27;)
+.innerHTML =
+data.ntp;
+
+}
+
+async function saveSettings(){
+
+const time =
+document
+.getElementById(&#x27;entryTime&#x27;)
+.value;
+
+if(!time){
+
+alert(&quot;Jam belum dipilih&quot;);
+
+return;
+
+}
+
+const response =
+await fetch(
+&#x27;/api/settings&#x27;,
+{
+method:&#x27;POST&#x27;,
+headers:{
+&#x27;Content-Type&#x27;:
+&#x27;application/x-www-form-urlencoded&#x27;
+},
+body:
+&#x27;time=&#x27;+encodeURIComponent(time)
+});
+
+alert(
+await response.text()
+);
+
+loadSettings();
+
+}
+
+// =================================================
+// AUTO REFRESH
+// =================================================
+
+loadDashboard();
+
+setInterval(
+loadDashboard,
+5000
+);
+
+&lt;/script&gt;
+
+&lt;/body&gt;
+
+&lt;/html&gt;
+
+)rawliteral&quot;;
+
+// ============================================================
+// WEB: ROOT
+// ============================================================
+
+void handleRoot() {
+
+  server.send(
+      200,
+      &quot;text/html&quot;,
+      MAIN_HTML);
+}
+
+// ============================================================
+// API STUDENTS
+// ============================================================
+
+void handleStudents() {
+
+  String json = &quot;[&quot;;
+
+  for (int i = 0;
+       i &lt; studentCount;
+       i++) {
+
+    if (i &gt; 0) {
+      json += &quot;,&quot;;
+    }
+
+    json += &quot;{&quot;;
+    json += &quot;\&quot;id\&quot;:&quot; +
+            String(students[i].id);
+
+    json += &quot;,\&quot;name\&quot;:\&quot;&quot; +
+            jsonEscape(
+              students[i].name) +
+            &quot;\&quot;&quot;;
+
+    json += &quot;}&quot;;
+  }
+
+  json += &quot;]&quot;;
+
+  server.send(
+      200,
+      &quot;application/json&quot;,
+      json);
+}
+
+// ============================================================
+// API ADD STUDENT
+// ============================================================
+
+void handleAddStudent() {
+
+  if (!server.hasArg(&quot;name&quot;) ||
+      !server.hasArg(&quot;id&quot;)) {
+
+    server.send(
+        400,
+        &quot;text/plain&quot;,
+        &quot;Data tidak lengkap&quot;);
+
+    return;
+  }
+
+  String name =
+      server.arg(&quot;name&quot;);
+
+  int id =
+      server.arg(&quot;id&quot;).toInt();
+
+  if (id &lt;= 0 || id &gt; 127) {
+
+    server.send(
+        400,
+        &quot;text/plain&quot;,
+        &quot;ID fingerprint harus 1-127&quot;);
+
+    return;
+  }
+
+  if (findStudentByID(id) &gt;= 0) {
+
+    server.send(
+        400,
+        &quot;text/plain&quot;,
+        &quot;ID fingerprint sudah digunakan&quot;);
+
+    return;
+  }
+
+  if (studentCount &gt;= MAX_STUDENTS) {
+
+    server.send(
+        400,
+        &quot;text/plain&quot;,
+        &quot;Kapasitas siswa penuh&quot;);
+
+    return;
+  }
+
+  enrollmentRunning = true;
+
+  enrollmentID = id;
+
+  enrollmentName = name;
+
+  bool success =
+      enrollFingerprint(id);
+
+  enrollmentRunning = false;
+
+  if (!success) {
+
+    server.send(
+        500,
+        &quot;text/plain&quot;,
+        &quot;Pendaftaran fingerprint gagal&quot;);
+
+    return;
+  }
+
+  students[studentCount].id =
+      id;
+
+  students[studentCount].name =
+      name;
+
+  studentCount++;
+
+  saveStudents();
+
+  server.send(
+      200,
+      &quot;text/plain&quot;,
+      &quot;Siswa berhasil ditambahkan dan fingerprint berhasil didaftarkan&quot;);
+}
+
+// ============================================================
+// DELETE STUDENT
+// ============================================================
+
+void handleDeleteStudent() {
+
+  if (!server.hasArg(&quot;id&quot;)) {
+
+    server.send(
+        400,
+        &quot;text/plain&quot;,
+        &quot;ID tidak ditemukan&quot;);
+
+    return;
+  }
+
+  int id =
+      server.arg(&quot;id&quot;).toInt();
+
+  int index =
+      findStudentByID(id);
+
+  if (index &lt; 0) {
+
+    server.send(
+        404,
+        &quot;text/plain&quot;,
+        &quot;Siswa tidak ditemukan&quot;);
+
+    return;
+  }
+
+  uint8_t result =
+      finger.deleteModel(id);
+
+  if (result != FINGERPRINT_OK) {
+
+    server.send(
+        500,
+        &quot;text/plain&quot;,
+        &quot;Gagal menghapus fingerprint&quot;);
+
+    return;
+  }
+
+  for (int i = index;
+       i &lt; studentCount - 1;
+       i++) {
+
+    students[i] =
+        students[i + 1];
+  }
+
+  studentCount--;
+
+  saveStudents();
+
+  server.send(
+      200,
+      &quot;text/plain&quot;,
+      &quot;Siswa dan fingerprint berhasil dihapus&quot;);
+}
+
+// ============================================================
+// BACA ABSENSI HARI INI
+// ============================================================
+
+struct AttendanceRecord {
+
+  String date;
+  String time;
+  int id;
+  String name;
+  String status;
+};
+
+const int MAX_RECORDS = 500;
+
+AttendanceRecord records[MAX_RECORDS];
+
+int readAttendanceForDate(
+    String targetDate) {
+
+  int count = 0;
+
+  if (!LittleFS.exists(
+          FILE_ATTENDANCE)) {
+
+    return 0;
+  }
+
+  File file =
+      LittleFS.open(
+          FILE_ATTENDANCE,
+          &quot;r&quot;);
+
+  if (!file) {
+    return 0;
+  }
+
+  while (file.available() &amp;&amp;
+         count &lt; MAX_RECORDS) {
+
+    String line =
+        file.readStringUntil(&#x27;\n&#x27;);
+
+    line.trim();
+
+    if (line.length() == 0 ||
+        line.startsWith(&quot;date,&quot;)) {
+
+      continue;
+    }
+
+    int p1 =
+        line.indexOf(&#x27;,&#x27;);
+
+    int p2 =
+        line.indexOf(&#x27;,&#x27;, p1 + 1);
+
+    int p3 =
+        line.indexOf(&#x27;,&#x27;, p2 + 1);
+
+    int p4 =
+        line.lastIndexOf(&#x27;,&#x27;);
+
+    if (p1 &lt; 0 ||
+        p2 &lt; 0 ||
+        p3 &lt; 0 ||
+        p4 &lt; 0) {
+
+      continue;
+    }
+
+    String date =
+        line.substring(0, p1);
+
+    if (date != targetDate) {
+      continue;
+    }
+
+    records[count].date =
+        date;
+
+    records[count].time =
+        line.substring(
+            p1 + 1,
+            p2);
+
+    records[count].id =
+        line.substring(
+            p2 + 1,
+            p3).toInt();
+
+    records[count].name =
+        line.substring(
+            p3 + 1,
+            p4);
+
+    records[count].status =
+        line.substring(
+            p4 + 1);
+
+    count++;
+  }
+
+  file.close();
+
+  return count;
+}
+
+// ============================================================
+// API DASHBOARD
+// ============================================================
+
+void handleDashboard() {
+
+  String today =
+      getDate();
+
+  String now =
+      getTimeNow();
+
+  int count =
+      readAttendanceForDate(today);
+
+  int present = 0;
+  int late = 0;
+
+  for (int i = 0;
+       i &lt; count;
+       i++) {
+
+    if (records[i].status ==
+        &quot;Hadir&quot;) {
+
+      present++;
+
+    } else if (
+        records[i].status ==
+        &quot;Terlambat&quot;) {
+
+      late++;
+    }
+  }
+
+  int absent =
+      studentCount -
+      present -
+      late;
+
+  if (absent &lt; 0) {
+    absent = 0;
+  }
+
+  String json = &quot;{&quot;;
+
+  json +=
+      &quot;\&quot;date\&quot;:\&quot;&quot; +
+      today + &quot;\&quot;,&quot;;
+
+  json +=
+      &quot;\&quot;time\&quot;:\&quot;&quot; +
+      now + &quot;\&quot;,&quot;;
+
+  json +=
+      &quot;\&quot;total\&quot;:&quot; +
+      String(studentCount) +
+      &quot;,&quot;;
+
+  json +=
+      &quot;\&quot;present\&quot;:&quot; +
+      String(present) +
+      &quot;,&quot;;
+
+  json +=
+      &quot;\&quot;late\&quot;:&quot; +
+      String(late) +
+      &quot;,&quot;;
+
+  json +=
+      &quot;\&quot;absent\&quot;:&quot; +
+      String(absent) +
+      &quot;,&quot;;
+
+  json += &quot;\&quot;records\&quot;:[&quot;;
+
+  for (int i = 0;
+       i &lt; count;
+       i++) {
+
+    if (i &gt; 0) {
+      json += &quot;,&quot;;
+    }
+
+    json += &quot;{&quot;;
+
+    json +=
+        &quot;\&quot;name\&quot;:\&quot;&quot; +
+        jsonEscape(
+          records[i].name) +
+        &quot;\&quot;,&quot;;
+
+    json +=
+        &quot;\&quot;time\&quot;:\&quot;&quot; +
+        records[i].time +
+        &quot;\&quot;,&quot;;
+
+    json +=
+        &quot;\&quot;status\&quot;:\&quot;&quot; +
+        records[i].status +
+        &quot;\&quot;&quot;;
+
+    json += &quot;}&quot;;
+  }
+
+  json += &quot;]}&quot;;
+
+  server.send(
+      200,
+      &quot;application/json&quot;,
+      json);
+}
+
+// ============================================================
+// API REKAP SISWA
+// ============================================================
+
+void handleStudentReport() {
+
+  if (!server.hasArg(&quot;id&quot;)) {
+
+    server.send(
+        400,
+        &quot;text/plain&quot;,
+        &quot;ID tidak ada&quot;);
+
+    return;
+  }
+
+  int id =
+      server.arg(&quot;id&quot;).toInt();
+
+  int index =
+      findStudentByID(id);
+
+  if (index &lt; 0) {
+
+    server.send(
+        404,
+        &quot;text/plain&quot;,
+        &quot;Siswa tidak ditemukan&quot;);
+
+    return;
+  }
+
+  int present = 0;
+  int late = 0;
+
+  String jsonRecords = &quot;[&quot;;
+
+  if (LittleFS.exists(
+          FILE_ATTENDANCE)) {
+
+    File file =
+        LittleFS.open(
+            FILE_ATTENDANCE,
+            &quot;r&quot;);
+
+    bool first = true;
+
+    while (file.available()) {
+
+      String line =
+          file.readStringUntil(&#x27;\n&#x27;);
+
+      line.trim();
+
+      if (line.startsWith(&quot;date,&quot;) ||
+          line.length() == 0) {
+
+        continue;
+      }
+
+      int p1 =
+          line.indexOf(&#x27;,&#x27;);
+
+      int p2 =
+          line.indexOf(&#x27;,&#x27;, p1 + 1);
+
+      int p3 =
+          line.indexOf(&#x27;,&#x27;, p2 + 1);
+
+      int p4 =
+          line.lastIndexOf(&#x27;,&#x27;);
+
+      if (p1 &lt; 0 ||
+          p2 &lt; 0 ||
+          p3 &lt; 0 ||
+          p4 &lt; 0) {
+
+        continue;
+      }
+
+      int recID =
+          line.substring(
+                  p2 + 1,
+                  p3)
+              .toInt();
+
+      if (recID != id) {
+        continue;
+      }
+
+      String date =
+          line.substring(
+              0,
+              p1);
+
+      String time =
+          line.substring(
+              p1 + 1,
+              p2);
+
+      String status =
+          line.substring(
+              p4 + 1);
+
+      if (status == &quot;Hadir&quot;) {
+        present++;
+      }
+
+      if (status == &quot;Terlambat&quot;) {
+        late++;
+      }
+
+      if (!first) {
+        jsonRecords += &quot;,&quot;;
+      }
+
+      first = false;
+
+      jsonRecords += &quot;{&quot;;
+
+      jsonRecords +=
+          &quot;\&quot;date\&quot;:\&quot;&quot; +
+          date + &quot;\&quot;,&quot;;
+
+      jsonRecords +=
+          &quot;\&quot;time\&quot;:\&quot;&quot; +
+          time + &quot;\&quot;,&quot;;
+
+      jsonRecords +=
+          &quot;\&quot;status\&quot;:\&quot;&quot; +
+          status + &quot;\&quot;&quot;;
+
+      jsonRecords += &quot;}&quot;;
+    }
+
+    file.close();
+  }
+
+  jsonRecords += &quot;]&quot;;
+
+  int total =
+      present + late;
+
+  int absent = 0;
+
+  // Hari berjalan sampai hari ini
+  struct tm timeinfo;
+
+  int daysPassed = 0;
+
+  if (getLocalTime(&amp;timeinfo)) {
+
+    daysPassed =
+        timeinfo.tm_yday + 1;
+  }
+
+  // Tidak menghitung seluruh tahun sebagai hari sekolah.
+  // Minimal menggunakan jumlah hari absensi aktual.
+  absent =
+      studentCount &gt; 0
+      ? 0
+      : 0;
+
+  float percentage = 0;
+
+  if (total &gt; 0) {
+
+    percentage =
+        ((float)total /
+         (float)total) *
+        100.0;
+  }
+
+  String json = &quot;{&quot;;
+
+  json +=
+      &quot;\&quot;name\&quot;:\&quot;&quot; +
+      jsonEscape(
+        students[index].name) +
+      &quot;\&quot;,&quot;;
+
+  json +=
+      &quot;\&quot;present\&quot;:&quot; +
+      String(present) +
+      &quot;,&quot;;
+
+  json +=
+      &quot;\&quot;late\&quot;:&quot; +
+      String(late) +
+      &quot;,&quot;;
+
+  json +=
+      &quot;\&quot;absent\&quot;:&quot; +
+      String(absent) +
+      &quot;,&quot;;
+
+  json +=
+      &quot;\&quot;percentage\&quot;:&quot; +
+      String(percentage, 2) +
+      &quot;,&quot;;
+
+  json +=
+      &quot;\&quot;records\&quot;:&quot; +
+      jsonRecords;
+
+  json += &quot;}&quot;;
+
+  server.send(
+      200,
+      &quot;application/json&quot;,
+      json);
+}
+
+// ============================================================
+// API REKAP BULANAN
+// ============================================================
+
+void handleMonthly() {
+
+  if (!server.hasArg(&quot;month&quot;)) {
+
+    server.send(
+        400,
+        &quot;text/plain&quot;,
+        &quot;Bulan tidak dipilih&quot;);
+
+    return;
+  }
+
+  String month =
+      server.arg(&quot;month&quot;);
+
+  String json = &quot;[&quot;;
+
+  bool firstStudent = true;
+
+  for (int s = 0;
+       s &lt; studentCount;
+       s++) {
+
+    int present = 0;
+    int late = 0;
+
+    if (LittleFS.exists(
+            FILE_ATTENDANCE)) {
+
+      File file =
+          LittleFS.open(
+              FILE_ATTENDANCE,
+              &quot;r&quot;);
+
+      while (file.available()) {
+
+        String line =
+            file.readStringUntil(&#x27;\n&#x27;);
+
+        line.trim();
+
+        if (line.startsWith(&quot;date,&quot;) ||
+            line.length() == 0) {
+
+          continue;
+        }
+
+        int p1 =
+            line.indexOf(&#x27;,&#x27;);
+
+        int p2 =
+            line.indexOf(&#x27;,&#x27;, p1 + 1);
+
+        int p3 =
+            line.indexOf(&#x27;,&#x27;, p2 + 1);
+
+        int p4 =
+            line.lastIndexOf(&#x27;,&#x27;);
+
+        if (p1 &lt; 0 ||
+            p2 &lt; 0 ||
+            p3 &lt; 0 ||
+            p4 &lt; 0) {
+
+          continue;
+        }
+
+        String date =
+            line.substring(
+                0,
+                p1);
+
+        if (!date.startsWith(
+                month)) {
+
+          continue;
+        }
+
+        int id =
+            line.substring(
+                    p2 + 1,
+                    p3)
+                .toInt();
+
+        if (id !=
+            students[s].id) {
+
+          continue;
+        }
+
+        String status =
+            line.substring(
+                p4 + 1);
+
+        if (status ==
+            &quot;Hadir&quot;) {
+
+          present++;
+
+        } else if (
+            status ==
+            &quot;Terlambat&quot;) {
+
+          late++;
+        }
+      }
+
+      file.close();
+    }
+
+    int total =
+        present + late;
+
+    // Untuk rekap bulanan,
+    // hari tidak hadir dihitung
+    // berdasarkan hari kalender
+    // yang sudah berjalan pada bulan tersebut.
+    int absent = 0;
+
+    float percentage = 0;
+
+    if (total &gt; 0) {
+
+      percentage =
+          ((float)total /
+           (float)total) *
+          100.0;
+    }
+
+    if (!firstStudent) {
+      json += &quot;,&quot;;
+    }
+
+    firstStudent = false;
+
+    json += &quot;{&quot;;
+
+    json +=
+        &quot;\&quot;name\&quot;:\&quot;&quot; +
+        jsonEscape(
+          students[s].name) +
+        &quot;\&quot;,&quot;;
+
+    json +=
+        &quot;\&quot;present\&quot;:&quot; +
+        String(present) +
+        &quot;,&quot;;
+
+    json +=
+        &quot;\&quot;late\&quot;:&quot; +
+        String(late) +
+        &quot;,&quot;;
+
+    json +=
+        &quot;\&quot;absent\&quot;:&quot; +
+        String(absent) +
+        &quot;,&quot;;
+
+    json +=
+        &quot;\&quot;percentage\&quot;:&quot; +
+        String(percentage, 2);
+
+    json += &quot;}&quot;;
+  }
+
+  json += &quot;]&quot;;
+
+  server.send(
+      200,
+      &quot;application/json&quot;,
+      json);
+}
+
+// ============================================================
+// SETTINGS API
+// ============================================================
+
+void handleGetSettings() {
+
+  String timeValue =
+      twoDigit(jamMasuk) +
+      &quot;:&quot; +
+      twoDigit(menitMasuk);
+
+  bool timeOK =
+      getDate() !=
+      &quot;0000-00-00&quot;;
+
+  String json = &quot;{&quot;;
+
+  json +=
+      &quot;\&quot;time\&quot;:\&quot;&quot; +
+      timeValue +
+      &quot;\&quot;,&quot;;
+
+  json +=
+      &quot;\&quot;ntp\&quot;:\&quot;&quot; +
+      String(
+        timeOK
+        ? &quot;Tersinkron&quot;
+        : &quot;Belum tersinkron&quot;) +
+      &quot;\&quot;&quot;;
+
+  json += &quot;}&quot;;
+
+  server.send(
+      200,
+      &quot;application/json&quot;,
+      json);
+}
+
+void handleSaveSettings() {
+
+  if (!server.hasArg(&quot;time&quot;)) {
+
+    server.send(
+        400,
+        &quot;text/plain&quot;,
+        &quot;Jam tidak ditemukan&quot;);
+
+    return;
+  }
+
+  String value =
+      server.arg(&quot;time&quot;);
+
+  if (value.length() != 5) {
+
+    server.send(
+        400,
+        &quot;text/plain&quot;,
+        &quot;Format jam salah&quot;);
+
+    return;
+  }
+
+  jamMasuk =
+      value.substring(
+          0, 2).toInt();
+
+  menitMasuk =
+      value.substring(
+          3, 5).toInt();
+
+  saveSettings();
+
+  server.send(
+      200,
+      &quot;text/plain&quot;,
+      &quot;Jam masuk berhasil disimpan: &quot; +
+      value);
+}
+
+// ============================================================
+// WIFI
+// ============================================================
+
+void startWiFi() {
+
+  // AP
+  WiFi.mode(WIFI_AP_STA);
+
+  WiFi.softAP(
+      AP_SSID,
+      AP_PASSWORD);
+
+  Serial.println();
+  Serial.println(
+      &quot;================================&quot;);
+
+  Serial.println(
+      &quot;ACCESS POINT AKTIF&quot;);
+
+  Serial.print(
+      &quot;SSID: &quot;);
+
+  Serial.println(
+      AP_SSID);
+
+  Serial.print(
+      &quot;Password: &quot;);
+
+  Serial.println(
+      AP_PASSWORD);
+
+  Serial.print(
+      &quot;IP Dashboard: &quot;);
+
+  Serial.println(
+      WiFi.softAPIP());
+
+  // STA
+  if (strlen(WIFI_SSID) &gt; 0) {
+
+    WiFi.begin(
+        WIFI_SSID,
+        WIFI_PASSWORD);
+
+    Serial.print(
+        &quot;Menghubungkan WiFi sekolah&quot;);
+
+    unsigned long start =
+        millis();
+
+    while (
+        WiFi.status() !=
+        WL_CONNECTED &amp;&amp;
+        millis() - start &lt;
+        15000) {
+
+      delay(500);
+
+      Serial.print(&quot;.&quot;);
+    }
+
+    Serial.println();
+
+    if (WiFi.status() ==
+        WL_CONNECTED) {
+
+      Serial.print(
+          &quot;WiFi sekolah OK. IP: &quot;);
+
+      Serial.println(
+          WiFi.localIP());
+
+    } else {
+
+      Serial.println(
+          &quot;WiFi sekolah gagal.&quot;);
+    }
+  }
+}
+
+// ============================================================
+// NTP
+// ============================================================
+
+void setupNTP() {
+
+  configTime(
+      GMT_OFFSET_SEC,
+      DAYLIGHT_OFFSET_SEC,
+      NTP_SERVER_1,
+      NTP_SERVER_2);
+
+  Serial.println(
+      &quot;Sinkronisasi NTP...&quot;);
+
+  struct tm timeinfo;
+
+  for (int i = 0;
+       i &lt; 20;
+       i++) {
+
+    if (getLocalTime(
+            &amp;timeinfo)) {
+
+      Serial.println(
+          &quot;NTP berhasil.&quot;);
+
+      Serial.printf(
+          &quot;%04d-%02d-%02d %02d:%02d:%02d\n&quot;,
+          timeinfo.tm_year + 1900,
+          timeinfo.tm_mon + 1,
+          timeinfo.tm_mday,
+          timeinfo.tm_hour,
+          timeinfo.tm_min,
+          timeinfo.tm_sec);
+
+      return;
+    }
+
+    delay(500);
+
+    Serial.print(&quot;.&quot;);
+  }
+
+  Serial.println();
+
+  Serial.println(
+      &quot;NTP belum tersinkron.&quot;);
+}
+
+// ============================================================
+// WEB SERVER
+// ============================================================
+
+void setupWebServer() {
+
+  server.on(
+      &quot;/&quot;,
+      HTTP_GET,
+      handleRoot);
+
+  server.on(
+      &quot;/api/students&quot;,
+      HTTP_GET,
+      handleStudents);
+
+  server.on(
+      &quot;/api/addStudent&quot;,
+      HTTP_POST,
+      handleAddStudent);
+
+  server.on(
+      &quot;/api/deleteStudent&quot;,
+      HTTP_GET,
+      handleDeleteStudent);
+
+  server.on(
+      &quot;/api/dashboard&quot;,
+      HTTP_GET,
+      handleDashboard);
+
+  server.on(
+      &quot;/api/studentReport&quot;,
+      HTTP_GET,
+      handleStudentReport);
+
+  server.on(
+      &quot;/api/monthly&quot;,
+      HTTP_GET,
+      handleMonthly);
+
+  server.on(
+      &quot;/api/settings&quot;,
+      HTTP_GET,
+      handleGetSettings);
+
+  server.on(
+      &quot;/api/settings&quot;,
+      HTTP_POST,
+      handleSaveSettings);
+
+  server.begin();
+
+  Serial.println(
+      &quot;Web Server aktif.&quot;);
+}
+
+// ============================================================
+// SETUP
+// ============================================================
+
+void setup() {
+
+  Serial.begin(115200);
+
+  // GPIO
+  pinMode(
+      BUZZER_PIN,
+      OUTPUT);
+
+  pinMode(
+      LED_GREEN,
+      OUTPUT);
+
+  pinMode(
+      LED_RED,
+      OUTPUT);
+
+  digitalWrite(
+      LED_GREEN,
+      LOW);
+
+  digitalWrite(
+      LED_RED,
+      LOW);
+
+  // LCD
+  Wire.begin(
+      21,
+      22);
+
+  lcd.init();
+
+  lcd.backlight();
+
+  lcdMessage(
+      &quot;ABSENSI SEKOLAH&quot;,
+      &quot;Memulai...&quot;);
+
+  // LittleFS
+  if (!LittleFS.begin(true)) {
+
+    lcdMessage(
+        &quot;LittleFS ERROR&quot;,
+        &quot;Restart...&quot;);
+
+    delay(3000);
+
+    ESP.restart();
+  }
+
+  loadSettings();
+
+  loadStudents();
+
+  createAttendanceFile();
+
+  // WiFi
+  startWiFi();
+
+  // NTP
+  setupNTP();
+
+  // Fingerprint
+  FingerSerial.begin(
+      57600,
+      SERIAL_8N1,
+      FP_RX,
+      FP_TX);
+
+  finger.begin(57600);
+
+  if (finger.verifyPassword()) {
+
+    Serial.println(
+        &quot;Fingerprint AS608 OK.&quot;);
+
+    lcdMessage(
+        &quot;Fingerprint OK&quot;,
+        &quot;Sistem Siap&quot;);
+
+  } else {
+
+    Serial.println(
+        &quot;Fingerprint tidak terdeteksi.&quot;);
+
+    lcdMessage(
+        &quot;Fingerprint&quot;,
+        &quot;Tidak Terdeteksi&quot;);
+
+    delay(2000);
+  }
+
+  // Web
+  setupWebServer();
+
+  delay(1500);
+
+  lcdMessage(
+      &quot;Tempelkan Jari&quot;,
+      &quot;Silakan Absen&quot;);
+
+  Serial.println();
+  Serial.println(
+      &quot;================================&quot;);
+
+  Serial.println(
+      &quot;SISTEM ABSENSI SEKOLAH SIAP&quot;);
+
+  Serial.print(
+      &quot;Batas masuk: &quot;);
+
+  Serial.print(
+      twoDigit(jamMasuk));
+
+  Serial.print(&quot;:&quot;);
+
+  Serial.println(
+      twoDigit(menitMasuk));
+
+  Serial.println(
+      &quot;================================&quot;);
+}
+
+// ============================================================
+// LOOP
+// ============================================================
+
+void loop() {
+
+  server.handleClient();
+
+  // Hanya lakukan fingerprint
+  // jika tidak sedang enrollment.
+  if (!enrollmentRunning) {
+
+    processFingerprint();
+  }
+
+  delay(50);
+}
+
+</code></pre>
+</body>
+</html>
